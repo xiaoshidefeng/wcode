@@ -1,0 +1,48 @@
+{
+  "name": "wcode",
+  "version": "0.2.0",
+  "description": "A minimal coding agent CLI with pluggable model providers",
+  "type": "module",
+  "license": "MIT",
+  "author": "xiaoshidefeng <a1330661071@gmail.com>",
+  "homepage": "https://github.com/xiaoshidefeng/wcode#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoshidefeng/wcode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaoshidefeng/wcode/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "cli",
+    "llm",
+    "agent",
+    "anthropic",
+    "openai",
+    "tool-use"
+  ],
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "bin": {
+    "wcode": "./bin/wcode.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
