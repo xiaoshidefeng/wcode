@@ -37,7 +37,7 @@
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {

@@ -1,6 +1,7 @@
 // bash: run a shell command with timeout and output capping.
 
 import { spawn } from "node:child_process";
+import { unlinkSync } from "node:fs";
 import os from "node:os";
 import type { Tool, ToolContext, ToolOutput } from "./types.js";
 import { ToolError, num, str } from "./types.js";
@@ -8,6 +9,18 @@ import { truncateOutput } from "./util.js";
 
 export const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 export const MAX_BASH_TIMEOUT_MS = 600_000;
+
+// Truncated-output spill files; removed on process exit (sync rm is legal there).
+const savedOutputFiles = new Set<string>();
+process.on("exit", () => {
+  for (const file of savedOutputFiles) {
+    try {
+      unlinkSync(file);
+    } catch {
+      /* already gone */
+    }
+  }
+});
 
 const DESCRIPTION = `Run a shell command and return its combined output.
 
@@ -102,12 +115,14 @@ export function createBashTool(defaultTimeoutMs = DEFAULT_BASH_TIMEOUT_MS): Tool
       const isError = timedOut || (code !== null && code !== 0);
       let body = text === "" ? `(no output)` : text;
       // When the output was actually truncated, persist the full text and tell
-      // the model where to find it (opencode-style).
+      // the model where to find it (opencode-style). Registered for deletion on
+      // exit so /tmp doesn't fill up with one file per long command.
       if (text !== "" && text !== output.trimEnd()) {
         const saved = `${os.tmpdir()}/wcode-output-${Date.now()}.txt`;
         try {
           const fs = await import("node:fs/promises");
           await fs.writeFile(saved, output, "utf8");
+          savedOutputFiles.add(saved);
           body += `\n\n[Output truncated. Full output saved to: ${saved}]`;
         } catch {
           /* best effort */

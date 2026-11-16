@@ -18,13 +18,15 @@ type SessionLine =
   | SessionHeader
   | { type: "message"; message: Message }
   | { type: "model"; model: string }
-  | { type: "todos"; todos: TodoItem[] };
+  | { type: "todos"; todos: TodoItem[] }
+  | { type: "title"; title: string };
 
 export class SessionStore {
   readonly id: string;
   readonly filePath: string;
   private header: SessionHeader;
   private dirty = 0;
+  private title: string | undefined;
 
   constructor(cwd: string, modelKey: string, id?: string) {
     this.id = id ?? randomId();
@@ -62,6 +64,30 @@ export class SessionStore {
     appendFileSync(this.filePath, JSON.stringify({ type: "todos", todos } satisfies SessionLine) + "\n");
   }
 
+  /** Append the session title (generated once after the first exchange). */
+  setTitle(title: string): void {
+    this.title = title;
+    appendFileSync(this.filePath, JSON.stringify({ type: "title", title } satisfies SessionLine) + "\n");
+  }
+
+  /**
+   * Replace the whole transcript (rewind): rewrite header + current messages.
+   * Returns the message count now on disk.
+   */
+  rewrite(messages: Message[]): number {
+    writeFileSync(this.filePath, JSON.stringify(this.header) + "\n", "utf8");
+    for (const message of messages) {
+      appendFileSync(this.filePath, JSON.stringify({ type: "message", message } satisfies SessionLine) + "\n");
+    }
+    appendFileSync(this.filePath, JSON.stringify({ type: "model", model: this.header.model } satisfies SessionLine) + "\n");
+    // A rewrite (compact/rewind) must not lose the generated title.
+    if (this.title !== undefined) {
+      appendFileSync(this.filePath, JSON.stringify({ type: "title", title: this.title } satisfies SessionLine) + "\n");
+    }
+    this.dirty = messages.length;
+    return messages.length;
+  }
+
   get messageCount(): number {
     return this.dirty;
   }
@@ -75,6 +101,7 @@ export interface SessionSummary {
   createdAt: string;
   messageCount: number;
   preview: string;
+  title?: string;
 }
 
 export function listSessions(): SessionSummary[] {
@@ -97,44 +124,50 @@ export function listSessions(): SessionSummary[] {
 export function parseSessionFile(file: string): SessionSummary {
   const lines = readFileSync(file, "utf8").split("\n").filter((l) => l.trim() !== "");
   const header = JSON.parse(lines[0]!) as SessionHeader;
-  const firstUser = lines.map((l) => JSON.parse(l) as SessionLine).find((l) => l.type === "message" && l.message.role === "user");
   let preview = "";
-  if (firstUser && firstUser.type === "message") {
-    const block = firstUser.message.content.find((b) => b.type === "text");
-    if (block && block.type === "text") preview = block.text.slice(0, 80);
+  let title: string | undefined;
+  let model = header.model;
+  // Single pass over the transcript (listSessions runs on every session file).
+  for (let i = 1; i < lines.length; i++) {
+    const entry = JSON.parse(lines[i]!) as SessionLine;
+    if (entry.type === "title") title = entry.title;
+    else if (entry.type === "model") model = entry.model;
+    else if (entry.type === "message" && preview === "" && entry.message.role === "user") {
+      const block = entry.message.content.find((b) => b.type === "text");
+      if (block && block.type === "text") preview = block.text.slice(0, 80);
+    }
   }
   return {
     file,
     id: header.id,
     cwd: header.cwd,
-    model: header.model,
+    model,
     createdAt: header.createdAt,
     messageCount: lines.length - 1,
     preview,
+    ...(title !== undefined ? { title } : {}),
   };
 }
 
-export function loadSessionMessages(file: string): { messages: Message[]; header: SessionHeader; todos?: TodoItem[] } {
+export function loadSessionMessages(file: string): { messages: Message[]; header: SessionHeader; todos?: TodoItem[]; title?: string } {
   const lines = readFileSync(file, "utf8").split("\n").filter((l) => l.trim() !== "");
   const header = JSON.parse(lines[0]!) as SessionHeader;
   const messages: Message[] = [];
   let model = header.model;
   let todos: TodoItem[] | undefined;
+  let title: string | undefined;
   for (const line of lines.slice(1)) {
     const entry = JSON.parse(line) as SessionLine;
     if (entry.type === "message") messages.push(entry.message);
     else if (entry.type === "model") model = entry.model;
     else if (entry.type === "todos") todos = entry.todos;
+    else if (entry.type === "title") title = entry.title;
   }
   header.model = model;
-  return { messages, header, todos };
+  return { messages, header, todos, title };
 }
 
 function randomId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-/** Path of the most recent session recorded in the given cwd (best effort). */
-export function latestSessionFor(cwd: string): string | undefined {
-  return listSessions().find((s) => s.cwd === cwd)?.file;
-}

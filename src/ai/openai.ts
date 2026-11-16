@@ -3,7 +3,7 @@
 // GLM, OpenRouter, Ollama, vLLM, ...).
 
 import type { ChatRequest, ContentBlock, Message, OpenAiCompat, StreamEvent, StreamFn } from "../types.js";
-import { AdapterBase, AbortedError, ApiError, EventQueue } from "./adapter-base.js";
+import { AdapterBase, AbortedError, ApiError, EventQueue, STREAM_IDLE_MS, streamGuard } from "./adapter-base.js";
 import { parseSse } from "./sse.js";
 
 type OaiMessage =
@@ -112,16 +112,23 @@ class OpenAiAdapter extends AdapterBase {
     let partial = this.emptyAssistant();
     const push = (event: StreamEvent) => queue.push(event);
     const cfg = compat(request);
+    // Idle guard: abort the body when the stream goes silent (user aborts
+    // still propagate through it); guarded aborts are reported as a stall.
+    const guard = streamGuard(signal);
     try {
       const response = await this.fetchWithRetry(
         url,
         { method: "POST", headers, body: JSON.stringify(body) },
-        signal,
+        guard.signal,
         (status) => status === 429 || (status >= 500 && status <= 504),
+        request.options.onRetry,
       );
       const blocks: ContentBlock[] = [];
       partial = { role: "assistant", content: blocks, stopReason: "stop", model: request.model.key };
       push({ type: "start", partial });
+      // Arm the idle window now: a response whose body never produces a
+      // single chunk would otherwise never arm the guard inside the loop.
+      guard.touch();
 
       // tool call index -> accumulating call
       const toolCalls = new Map<number, { id: string; name: string; json: string }>();
@@ -130,7 +137,8 @@ class OpenAiAdapter extends AdapterBase {
       let modelLabel = request.model.key;
 
       for await (const sse of parseSse(response.body!)) {
-        if (signal?.aborted) throw new AbortedError();
+        guard.touch(); // bytes arrived — re-arm the idle window
+        if (guard.signal.aborted) throw new AbortedError();
         if (!sse.data || sse.data === "[DONE]") continue;
         let chunk: any;
         try {
@@ -195,19 +203,24 @@ class OpenAiAdapter extends AdapterBase {
         ...(usage.cacheRead !== undefined ? { cacheReadTokens: usage.cacheRead } : {}),
       };
       partial.model = modelLabel;
-      if (signal?.aborted) {
+      if (guard.signal.aborted && !guard.timedOut()) {
         partial.stopReason = "aborted";
         push({ type: "error", reason: "aborted", errorMessage: "aborted by user", message: partial });
       } else {
         push({ type: "done", reason: partial.stopReason, message: partial });
       }
     } catch (err) {
-      partial.stopReason = "error";
-      const aborted = err instanceof AbortedError || signal?.aborted;
+      const stalled = guard.timedOut();
+      const aborted = !stalled && (err instanceof AbortedError || guard.signal.aborted);
       partial.stopReason = aborted ? "aborted" : "error";
-      partial.errorMessage = aborted ? "aborted by user" : describe(err);
+      partial.errorMessage = aborted
+        ? "aborted by user"
+        : stalled
+          ? `stream idle for over ${Math.round(STREAM_IDLE_MS / 1000)}s — connection stalled, aborted`
+          : describe(err);
       push({ type: "error", reason: aborted ? "aborted" : "error", errorMessage: partial.errorMessage, message: partial });
     } finally {
+      guard.done();
       queue.close();
     }
   }

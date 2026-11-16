@@ -8,6 +8,19 @@
 //                                  was approved, PLAN_FEEDBACK:keep-planning otherwise
 //   TODO-TASK in system:           turn 1 emits a `todo_write` tool_call; turn 2
 //                                  answers TODO_OK:list-tracked
+//   MCP-TASK in system:            turn 1 emits a `mcp__testsrv__echo` tool_call;
+//                                  turn 2 answers MCP_OK:<echoed text>
+//   TASK-SUBAGENT in system:       turn 1 emits a `task` tool_call (explore);
+//                                  turn 2 answers PARENT_GOT:<subagent report>
+//   subagent context ("wcode subagent dispatched" in system):
+//                                  turn 1 emits a `read` call; turn 2 answers
+//                                  SUB_REPORT:<file content>
+//   DENY-TASK in system:           turn 1 emits a `bash` call; turn 2 answers
+//                                  DENY_ENFORCED when the call was rule-blocked
+//   STALL-TASK in system:          main stream goes silent after one chunk
+//                                  (client must recover via idle timeout)
+//   STALL_SUB in a task prompt:    the subagent stream goes silent likewise
+//   GREET_SENTINEL in user msg:    answers GREET_RECEIVED:<arg> (custom commands)
 import http from "node:http";
 
 const state = { requests: [] };
@@ -70,6 +83,9 @@ function handle(req, res, body) {
     }
 
     const id = "chatcmpl-test";
+    const systemText = parsed.messages.find((m) => m.role === "system")?.content ?? "";
+    const isSubagent = systemText.includes("wcode subagent dispatched");
+
     const pasteHit = parsed.messages.some(
       (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("PASTE_SENTINEL"),
     );
@@ -81,23 +97,103 @@ function handle(req, res, body) {
       return;
     }
 
+    // Custom-command e2e: the expanded template reached the model verbatim.
+    const greetArg = parsed.messages.find(
+      (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("GREET_SENTINEL"),
+    )?.content?.match(/GREET_SENTINEL=(\S+)/)?.[1];
+    if (greetArg !== undefined) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      sse(res, [textChunk(id, { role: "assistant", content: `GREET_RECEIVED:${greetArg}` }), textChunk(id, {}, "stop")]);
+      return;
+    }
+
+    // Subagent loop: read the file, then report it back as the final message.
+    if (isSubagent) {
+      // STALL_SUB in the task prompt: hold the stream open forever after one
+      // chunk — the client must recover via its stream idle timeout.
+      const stallSub = JSON.stringify(parsed.messages.find((m) => m.role === "user")?.content ?? "").includes("STALL_SUB");
+      if (stallSub) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify(textChunk(id, { role: "assistant", content: "starting…" }))}\n\n`);
+        return; // deliberately never write again, never end
+      }
+      const hasResult = parsed.messages.some((m) => m.role === "tool");
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (!hasResult) {
+        sse(res, [
+          textChunk(id, { role: "assistant", content: "Reading the file." }),
+          textChunk(id, {
+            tool_calls: [{ index: 0, id: "call_sub_read", type: "function", function: { name: "read", arguments: '{"path": "hello.txt"}' } }],
+          }),
+          textChunk(id, {}, "tool_calls"),
+        ]);
+      } else {
+        const content = parsed.messages.find((m) => m.role === "tool")?.content ?? "";
+        const found = content.match(/hello from hello\.txt/)?.[0] ?? "not found";
+        sse(res, [textChunk(id, { role: "assistant", content: `SUB_REPORT:${found}` }), textChunk(id, {}, "stop")]);
+      }
+      return;
+    }
+
     const hasToolResult = parsed.messages.some((m) => m.role === "tool");
-    const wantsWrite = parsed.messages.some(
-      (m) => m.role === "system" && m.content.includes("WRITE-TASK"),
-    );
-    const wantsPlan = parsed.messages.some(
-      (m) => m.role === "system" && m.content.includes("PLAN-TASK"),
-    );
-    const wantsTodo = parsed.messages.some(
-      (m) => m.role === "system" && m.content.includes("TODO-TASK"),
-    );
+    const wantsWrite = systemText.includes("WRITE-TASK");
+    const wantsPlan = systemText.includes("PLAN-TASK");
+    const wantsTodo = systemText.includes("TODO-TASK");
+    const wantsMcp = systemText.includes("MCP-TASK");
+    const wantsSub = systemText.includes("TASK-SUBAGENT");
+    const wantsDeny = systemText.includes("DENY-TASK");
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
 
+    // STALL-TASK in system: hold the main stream open forever after one
+    // chunk — the CLI must abort it via the idle timeout, not hang.
+    if (systemText.includes("STALL-TASK")) {
+      res.write(`data: ${JSON.stringify(textChunk(id, { role: "assistant", content: "starting…" }))}\n\n`);
+      return; // deliberately never write again, never end
+    }
+
     if (!hasToolResult) {
+      if (wantsMcp) {
+        const args = JSON.stringify({ text: "ping-mcp-42" });
+        sse(res, [
+          textChunk(id, { role: "assistant", content: "Calling the MCP tool." }),
+          textChunk(id, {
+            tool_calls: [{ index: 0, id: "call_mcp_1", type: "function", function: { name: "mcp__testsrv__echo", arguments: args } }],
+          }),
+          textChunk(id, {}, "tool_calls"),
+        ]);
+        return;
+      }
+      if (wantsSub) {
+        const args = JSON.stringify({
+          description: "find hello file",
+          prompt: "Read hello.txt in the working directory and report its first line.",
+          subagent_type: "explore",
+        });
+        const cut = Math.floor(args.length / 2);
+        sse(res, [
+          textChunk(id, { role: "assistant", content: "Delegating to a subagent." }),
+          textChunk(id, {
+            tool_calls: [{ index: 0, id: "call_task_1", type: "function", function: { name: "task", arguments: args.slice(0, cut) } }],
+          }),
+          textChunk(id, { tool_calls: [{ index: 0, function: { arguments: args.slice(cut) } }] }),
+          textChunk(id, {}, "tool_calls"),
+        ]);
+        return;
+      }
+      if (wantsDeny) {
+        sse(res, [
+          textChunk(id, { role: "assistant", content: "Running a command." }),
+          textChunk(id, {
+            tool_calls: [{ index: 0, id: "call_bash_1", type: "function", function: { name: "bash", arguments: '{"command": "echo blocked-command-xyz"}' } }],
+          }),
+          textChunk(id, {}, "tool_calls"),
+        ]);
+        return;
+      }
       if (wantsTodo) {
         // Task list: emit a todo_write call (args split across chunks).
         const args = JSON.stringify({
@@ -163,6 +259,27 @@ function handle(req, res, body) {
           textChunk(id, {}, "tool_calls"),
         ]);
       }
+      return;
+    }
+
+    if (wantsMcp) {
+      const toolMsg = parsed.messages.find((m) => m.role === "tool");
+      const echoed = (toolMsg?.content ?? "").match(/echo:ping-mcp-42/)?.[0];
+      sse(res, [textChunk(id, { role: "assistant", content: echoed ? `MCP_OK:${echoed}` : `MCP_FAIL:${(toolMsg?.content ?? "").slice(0, 120)}` }), textChunk(id, {}, "stop")]);
+      return;
+    }
+
+    if (wantsSub) {
+      const toolMsg = parsed.messages.find((m) => m.role === "tool");
+      const report = (toolMsg?.content ?? "").match(/SUB_REPORT:hello from hello\.txt/)?.[0] ?? "no-report";
+      sse(res, [textChunk(id, { role: "assistant", content: `PARENT_GOT:${report}` }), textChunk(id, {}, "stop")]);
+      return;
+    }
+
+    if (wantsDeny) {
+      const toolMsg = parsed.messages.find((m) => m.role === "tool");
+      const denied = (toolMsg?.content ?? "").includes("denied by a permission rule");
+      sse(res, [textChunk(id, { role: "assistant", content: denied ? "DENY_ENFORCED" : "DENY_FAILED" }), textChunk(id, {}, "stop")]);
       return;
     }
 

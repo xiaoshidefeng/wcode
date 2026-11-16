@@ -89,7 +89,14 @@ export interface ModelConfig {
   /** Model accepts image input. */
   input?: ("text" | "image")[];
   /** $ per million tokens, used only for the cost display. */
-  cost?: { input?: number; output?: number };
+  cost?: {
+    input?: number;
+    output?: number;
+    /** $/M for cache-read tokens (default 0.1 × input). */
+    cacheRead?: number;
+    /** $/M for cache-write tokens (default 1.25 × input). */
+    cacheWrite?: number;
+  };
 }
 
 /** Extra knobs for half-compatible vendors speaking the openai dialect. */
@@ -117,6 +124,10 @@ export interface ProviderConfig {
   models: ModelConfig[];
   /** openai-completions dialect tweaks. */
   compat?: OpenAiCompat;
+  /** Set false to omit Anthropic prompt-cache breakpoints (cache_control) —
+   * for proxies that reject unknown request fields. Anthropic-protocol
+   * providers cache by default (tools/system/last message). */
+  promptCaching?: boolean;
 }
 
 export interface ResolvedModel {
@@ -134,11 +145,11 @@ export type AuthHeaderStyle = "bearer" | "x-api-key" | "none";
 export interface StreamOptions {
   apiKey?: string;
   headers?: Record<string, string>;
-  /** 0 = off. Adapter decides how to map this onto its protocol. */
-  thinking?: "off" | "normal";
   signal?: AbortSignal;
   maxTokens?: number;
   temperature?: number;
+  /** Connection-level retry feedback (before streaming starts), 1-based attempt. */
+  onRetry?: (attempt: number, delayMs: number, reason: string) => void;
 }
 
 // ---------------------------------------------------------------------------

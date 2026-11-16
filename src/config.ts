@@ -4,13 +4,16 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import type { ModelConfig, ProviderConfig, ResolvedModel } from "./types.js";
+import { stripJsonComments } from "./jsonc.js";
 
 export interface WCodeConfig {
   /** Default model selector "provider/modelId". */
   defaultModel?: string;
   providers: Record<string, Partial<ProviderConfig>>;
+  /** MCP stdio servers, exposed to the model as mcp__<server>__<tool>. */
+  mcpServers?: Record<string, unknown>;
 }
 
 export const CONFIG_DIR =
@@ -178,51 +181,16 @@ export function loadUserConfig(path = CONFIG_PATH): { config: WCodeConfig; path:
   if (raw !== undefined) {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(stripComments(raw));
+      parsed = JSON.parse(stripJsonComments(raw));
     } catch (err) {
       throw new Error(`failed to parse config at ${candidate}: ${(err as Error).message}`);
     }
     const obj = parsed as WCodeConfig;
     config.defaultModel = typeof obj.defaultModel === "string" ? obj.defaultModel : undefined;
     config.providers = obj.providers ?? {};
+    config.mcpServers = obj.mcpServers && typeof obj.mcpServers === "object" ? obj.mcpServers : undefined;
   }
   return { config, path: candidate };
-}
-
-/** Allow // and /* *\/ comments in the user's config for convenience. */
-function stripComments(src: string): string {
-  let out = "";
-  let i = 0;
-  let inString = false;
-  while (i < src.length) {
-    const ch = src[i]!;
-    if (inString) {
-      out += ch;
-      if (ch === "\\" && i + 1 < src.length) out += src[++i]!;
-      else if (ch === '"') inString = false;
-      i++;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === "/" && src[i + 1] === "/") {
-      while (i < src.length && src[i] !== "\n") i++;
-      continue;
-    }
-    if (ch === "/" && src[i + 1] === "*") {
-      i += 2;
-      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
-      i += 2;
-      continue;
-    }
-    out += ch;
-    i++;
-  }
-  return out;
 }
 
 /** Field-wise merge of a built-in provider with its user config entry. */
@@ -394,6 +362,3 @@ export function saveProviderApiKey(providerId: string, apiKey: string): string {
   return CONFIG_PATH;
 }
 
-export function defaultModelPath(): string {
-  return resolve(process.cwd());
-}

@@ -7,19 +7,38 @@
 // (bracketed paste) and backslash continuations.
 
 import { StringDecoder } from "node:string_decoder";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import type { AgentEvent } from "../agent/agent.js";
 import type { SessionOptions } from "./session.js";
-import { SessionController } from "./session.js";
+import { SessionController, SHORTCUTS, SLASH_COMMANDS, type PermissionAnswer, type ToastKind } from "./session.js";
 import { fg, style } from "./render.js";
 import { VERSION } from "../version.js";
+import { CONFIG_DIR } from "../config.js";
+import { loadCustomCommands } from "../commands.js";
+import { listSessions } from "../session/store.js";
 import { listFiles } from "../tools/util.js";
 import { KeyStream, type ParsedKey } from "./keys.js";
+import { fuzzyFilter } from "./fuzzy.js";
+import { initTheme, listThemes, activeThemeName } from "./theme.js";
 import type { ToolPermissionRequest } from "../tools/types.js";
 import type { ModelEntry } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Display-width helpers (CJK chars occupy 2 terminal columns)
 // ---------------------------------------------------------------------------
+
+/** One fuzzy-searchable palette entry (command or action). */
+type PaletteItem = { name: string; description: string; run: () => void | Promise<void> };
+
+// Flicker control: hide the cursor across redraws and ask the terminal to
+// synchronize the update (\x1b[?2026h — unsupported terminals just ignore it).
+const CURSOR_HIDE = "\x1b[?25l";
+const CURSOR_SHOW = "\x1b[?25h";
+const SYNC_BEGIN = "\x1b[?2026h";
+const SYNC_END = "\x1b[?2026l";
 
 function charWidth(code: number): number {
   if (
@@ -127,6 +146,8 @@ class RawEditor {
   private historyIndex = -1;
   private historyDraft = "";
   onKeysRaw: ((data: string) => void) | null = null; // intercept hook (busy keys)
+  /** Fired after a submitted line enters the history (persistence hook). */
+  onHistoryPush: ((text: string) => void) | null = null;
   enabled = true;
 
   get isSingleLine(): boolean {
@@ -146,12 +167,17 @@ class RawEditor {
     return this.state.lines.every((l) => l === "");
   }
 
+  /** Load a persisted history (oldest first). */
+  seedHistory(items: string[]): void {
+    this.history = [...items];
+  }
+
   handleKey(data: string): "submit" | "abort" | "quit" | "tab" | null {
     const st = this.state;
     const line = () => st.lines[st.line]!;
     const setLine = (s: string) => (st.lines[st.line] = s);
 
-    if (data === "\r" || data === "\n") {
+    if (data === "\r") {
       // Trailing backslash = soft line break (multi-line input without paste).
       const cur = line();
       if (cur.endsWith("\\") && !cur.endsWith("\\\\")) {
@@ -162,6 +188,15 @@ class RawEditor {
         return null;
       }
       return "submit";
+    }
+    if (data === "\n") {
+      // ctrl+j: insert a newline (return submits).
+      const cur = line();
+      st.lines[st.line] = cur.slice(0, st.col);
+      st.lines.splice(st.line + 1, 0, cur.slice(st.col));
+      st.line++;
+      st.col = 0;
+      return null;
     }
     if (data === "\x7f") {
       // backspace
@@ -203,7 +238,9 @@ class RawEditor {
       return null;
     }
     if (data === "\x1b[A") {
-      if (st.lines.length === 1 && line() === "") {
+      // Up recalls history when the cursor can't move up a line anyway
+      // (opencode guard: cursor at offset 0 of the first line).
+      if (st.lines.length === 1 && st.col === 0) {
         this.recallHistory(1);
       } else if (st.line > 0) {
         st.line--;
@@ -212,7 +249,10 @@ class RawEditor {
       return null;
     }
     if (data === "\x1b[B") {
-      if (st.line < st.lines.length - 1) {
+      // While browsing history, down walks forward; otherwise it moves lines.
+      if (this.historyIndex !== -1 && st.lines.length === 1) {
+        this.recallHistory(-1);
+      } else if (st.line < st.lines.length - 1) {
         st.line++;
         st.col = Math.min(st.col, st.lines[st.line]!.length);
       }
@@ -260,18 +300,29 @@ class RawEditor {
   private recallHistory(dir: 1 | -1): void {
     if (this.history.length === 0) return;
     if (this.historyIndex === -1 && dir === 1) {
-      this.historyDraft = "";
+      // Entering history: the current buffer is the draft to restore later.
+      this.historyDraft = this.text;
       this.historyIndex = this.history.length;
     }
     const next = this.historyIndex + dir;
     if (next < 0 || next > this.history.length) return;
-    if (this.historyIndex === this.history.length) this.historyDraft = this.text;
+    if (next === this.history.length) {
+      this.historyIndex = -1;
+      this.reset(this.historyDraft);
+      this.state.col = this.historyDraft.split("\n").slice(-1)[0]!.length;
+      return;
+    }
     this.historyIndex = next;
-    this.reset(next === this.history.length ? this.historyDraft : this.history[next]!);
+    this.reset(this.history[next]!);
+    this.state.col = this.history[next]!.split("\n").slice(-1)[0]!.length;
   }
 
   pushHistory(text: string): void {
-    if (text.trim() !== "" && this.history[this.history.length - 1] !== text) this.history.push(text);
+    if (text.trim() !== "" && this.history[this.history.length - 1] !== text) {
+      this.history.push(text);
+      if (this.history.length > 500) this.history.shift();
+      this.onHistoryPush?.(text);
+    }
   }
 }
 
@@ -292,6 +343,8 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
   stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
   const editor = new RawEditor();
+  editor.seedHistory(loadHistory());
+  editor.onHistoryPush = (t) => appendHistory(t);
   const md = new LineBufferStreamer(styleMarkdownLine);
   const thinking = new LineBufferStreamer(styleThinkingLine);
   const decoder = new StringDecoder("utf8");
@@ -302,13 +355,26 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
   let fileIndex: string[] | null = null;
   const pastes = new Map<string, string>();
   let pasteSeq = 0;
-  // interactive /models picker (arrow keys + enter to switch)
-  let picker: { items: ModelEntry[]; index: number } | null = null;
+  // generic dialog picker (models, sessions, …): arrow keys + enter to pick
+  let picker: {
+    title: string;
+    items: { label: string; detail?: string; mark?: "ok" | "fail" }[];
+    index: number;
+    onPick: (item: { label: string; detail?: string; mark?: "ok" | "fail"; value?: string }) => void | Promise<void>;
+  } | null = null;
+  // command palette (ctrl+p): fuzzy search over every command
+  let palette: { all: PaletteItem[]; index: number; query: string } | null = null;
   let transientLines: string[] = []; // spinner/status lines rendered above the box
   let mode: "input" | "permission" | "exiting" = "input";
-  let permissionResolve: ((ok: boolean) => void) | null = null;
-  let queuedPrompt: string | null = null;
+  let permissionResolve: ((ans: PermissionAnswer) => void) | null = null;
+  // double-esc interrupt arming (opencode): first esc arms for 5s, second aborts
+  let interruptArmedAt = 0;
+  // toasts: transient notifications rendered above the input box
+  let toasts: { text: string; kind: ToastKind; at: number }[] = [];
+  let toastTimer: NodeJS.Timeout | null = null;
   let streaming = false;
+  /** mode is mutated from nested callbacks; TS narrowing can't see it. */
+  const isExiting = (): boolean => mode === "exiting";
   // unified busy spinner (waiting for model / tools running)
   let spinTimer: NodeJS.Timeout | null = null;
   let spinActive = false;
@@ -316,27 +382,30 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
   let spinStartedAt = 0;
   const SPIN = ["✻", "✽", "✶", "✳"];
   const TOOL_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  // whimsical per-turn verbs (claude-code convention)
+  const SPIN_VERBS = [
+    "Working", "Thinking", "Pondering", "Brewing", "Vibing", "Conjuring", "Simmering",
+    "Noodling", "Percolating", "Hustling", "Polishing", "Cooking", "Ideating", "Mulling", "Crunching",
+  ];
+  const spinVerb = () => SPIN_VERBS[Math.floor(Math.random() * SPIN_VERBS.length)]!;
   let spinIsTool = false;
   let spinLabel = "";
-  let lastEscAt = 0;
 
   const controller = new SessionController(options, {
     print: (line) => printAbove(line),
     onEvent: handleAgentEvent,
     askPermission: askPermission,
     askPlanApproval: askPlanApproval,
+    toast: (text, kind) => showToast(text, kind),
+    onTitle: (title) => setWindowTitle(title),
   });
+  initTheme(controller.themeSetting);
 
-  /** shift+tab: cycle build → edit → plan (claude-code convention). Ignored mid-prompt. */
+  /** shift+tab: cycle build → edit → plan. The persistent hint row above the
+   * box is the feedback (no transcript spam). */
   function toggleMode(): void {
-    const m = controller.toggleMode();
-    const notice =
-      m === "plan"
-        ? `${fg.magenta("⏸ plan mode on")} ${style.dim("— read-only research · agent submits its plan via exit_plan")}`
-        : m === "edit"
-          ? `${fg.cyan("⏵⏵ edit mode on")} ${style.dim("— file edits auto-approved · bash still asks")}`
-          : `${fg.green("● build mode")} ${style.dim("— file edits ask for approval")}`;
-    printAbove(notice);
+    controller.toggleMode();
+    drawBottom(true);
   }
 
   // Background file index for @-completion (gitignore-aware, capped).
@@ -349,17 +418,83 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
 
   const statusText = () => {
     const t = controller.totals;
-    const tok = t.inputTokens + t.outputTokens > 0 ? ` · in ${fmtK(t.inputTokens)} out ${fmtK(t.outputTokens)}` : "";
+    const w = width();
     const limit = controller.model.model.contextWindow;
-    const pct = limit ? Math.min(100, Math.round((controller.contextTokens / limit) * 100)) : 0;
-    const ctx = controller.contextTokens > 0 ? ` · ctx ${pct}%` : "";
+    const usedPct = limit ? Math.min(100, Math.round((controller.contextTokens / limit) * 100)) : 0;
+    // context fills green → yellow → red (claude-code-style gradation), shown
+    // as remaining (opencode's "12% left" convention)
+    const ctxCol = usedPct >= 85 ? fg.red : usedPct >= 60 ? fg.yellow : fg.green;
+    const ctx = controller.contextTokens > 0 ? ` · ${ctxCol(`ctx ${Math.max(0, 100 - usedPct)}% left`)}` : "";
     const cost = t.cost > 0 ? ` · $${t.cost >= 0.01 ? t.cost.toFixed(2) : t.cost.toFixed(4)}` : "";
-    const dir = shortCwd(options.cwd);
-    const modeLabel = controller.mode === "plan" ? " · plan mode" : controller.mode === "edit" ? " · edit mode" : "";
+    const queue = controller.pendingCount > 0 ? ` · ⏎${controller.pendingCount}` : "";
     const todos = controller.todos;
     const tasks = todos.length > 0 ? ` · ${todos.filter((x) => x.status === "completed").length}/${todos.length} tasks` : "";
-    return ` ${controller.modelKey} · ${dir}${tok}${ctx}${cost}${controller.policy === "yolo" ? " · yolo" : ""}${modeLabel}${tasks} `;
+    const modeLabel = controller.mode === "plan" ? " · plan mode" : controller.mode === "edit" ? " · edit mode" : "";
+    const flags = `${controller.policy === "yolo" ? " · yolo" : ""}${modeLabel}${tasks}${queue}`;
+    // Narrow terminals drop weight progressively: tokens first, then dir.
+    const tok = t.inputTokens + t.outputTokens > 0 ? ` · in ${fmtK(t.inputTokens)} out ${fmtK(t.outputTokens)}` : "";
+    const core = ` ${controller.modelKey}${ctx}${cost}${flags} `;
+    if (stringWidth(stripAnsi(core)) + 4 > w) return core; // already too long — clampWidth trims it
+    const withDir = ` ${controller.modelKey} · ${shortCwd(options.cwd)}${ctx}${cost}${flags} `;
+    return stringWidth(stripAnsi(withDir)) + 4 <= w ? withDir : core;
   };
+
+  /** Persistent rows between the menus and the input box: active-mode hint
+   * (claude-code keeps one visible while a mode is on) + empty-input hints. */
+  function hintRows(): string[] {
+    const w = width();
+    const rows: string[] = [];
+    if (controller.mode === "plan") rows.push(`  ${fg.magenta("⏸ plan mode on")} ${style.dim("(shift+tab to cycle)")}`);
+    else if (controller.mode === "edit") rows.push(`  ${fg.cyan("⏵⏵ accept edits on")} ${style.dim("(shift+tab to cycle)")}`);
+    else if (controller.policy === "yolo") rows.push(`  ${fg.yellow("⏵⏵ yolo on")} ${style.dim("(permission prompts off · /yolo to re-enable)")}`);
+    const limit = controller.model.model.contextWindow;
+    const pct = limit ? Math.min(100, Math.round((controller.contextTokens / limit) * 100)) : 0;
+    if (pct >= 85) rows.push(style.dim("  ⚠ context nearly full — /compact to free space"));
+    if (interruptArmedAt > 0 && Date.now() - interruptArmedAt < 5000) {
+      rows.push(`  ${fg.yellow("esc again to interrupt")}`);
+    }
+    if (menuItems.length === 0 && !fileMenu && !picker && !palette && editor.isEmpty() && mode === "input" && !controller.busy) {
+      rows.push(style.dim("  ? shortcuts · ctrl+p palette · ! bash · # memory · / commands · @ files"));
+    }
+    // Every row must fit the terminal or the region row accounting breaks.
+    return rows.map((r) => clampWidth(r, w - 2));
+  }
+
+  // ----- toasts (transient notifications; opencode ui/toast.tsx, simplified) --
+
+  function showToast(text: string, kind: ToastKind = "info"): void {
+    toasts.push({ text, kind, at: Date.now() });
+    if (toasts.length > 3) toasts = toasts.slice(-3);
+    scheduleToastExpiry();
+    drawBottom(true);
+  }
+
+  function scheduleToastExpiry(): void {
+    if (toastTimer) return;
+    toastTimer = setInterval(() => {
+      const before = toasts.length;
+      toasts = toasts.filter((t) => Date.now() - t.at < 5000);
+      if (toasts.length === 0) {
+        clearInterval(toastTimer!);
+        toastTimer = null;
+      }
+      if (toasts.length !== before) drawBottom(true);
+    }, 1000);
+  }
+
+  function renderToasts(): string[] {
+    toasts = toasts.filter((t) => Date.now() - t.at < 5000);
+    if (toasts.length === 0) return [];
+    const t = toasts[toasts.length - 1]!;
+    const color = t.kind === "error" ? fg.red : t.kind === "success" ? fg.green : t.kind === "warning" ? fg.yellow : fg.cyan;
+    const glyph = t.kind === "error" ? "✗" : t.kind === "success" ? "✓" : t.kind === "warning" ? "⚠" : "·";
+    const more = toasts.length > 1 ? style.dim(` (+${toasts.length - 1})`) : "";
+    return [clampWidth(` ${color(glyph)} ${t.text}${more}`, width() - 4)];
+  }
+
+  function setWindowTitle(title: string): void {
+    stdout.write(`\x1b]0;wcode · ${title}\x07`);
+  }
 
   // Cursor anchor tracking (the invariant every draw maintains):
   // after drawBottom, the cursor sits at the edit position inside the input
@@ -369,11 +504,13 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
   let bottomRows = 0;
   let cursorRowInRegion = 0;
 
-  function clearRegion(): void {
-    if (bottomRows > 0) {
-      if (cursorRowInRegion > 0) stdout.write(`\x1b[${cursorRowInRegion}A`);
-      stdout.write("\r\x1b[J");
-    }
+  /** Escape prefix that erases the previous bottom region from wherever the
+   * cursor currently rests. Returned as a string instead of written directly:
+   * the clear must land in the SAME write as the redrawn content, or the
+   * terminal paints the erased region in between — that gap is the flicker. */
+  function regionClearPrefix(): string {
+    if (bottomRows === 0) return "";
+    return `${cursorRowInRegion > 0 ? `\x1b[${cursorRowInRegion}A` : ""}\r\x1b[J`;
   }
 
   /** Visible window of `line` around the cursor for horizontal overflow. */
@@ -389,11 +526,17 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     return { text, colOffset: start };
   }
 
-  function drawBottom(clearFirst: boolean): void {
+  /** Build the bottom region rows plus the reposition suffix that parks the
+   * cursor at the edit position. Mutates the bottomRows/cursorRowInRegion
+   * anchors; callers capture regionClearPrefix() BEFORE calling this. */
+  function buildBottomRegion(): { body: string; reposition: string } {
     const w = width();
-    if (clearFirst) clearRegion();
     const lines: string[] = [];
-    const topRows = picker ? renderPicker(w) : fileMenu ? renderFileMenu(w) : renderMenu(w);
+    const topRows = [
+      ...(palette ? renderPalette(w) : picker ? renderPicker(w) : fileMenu ? renderFileMenu(w) : renderMenu(w)),
+      ...hintRows(),
+      ...renderToasts(),
+    ];
     for (const hint of topRows) lines.push(hint);
     lines.push(...transientLines);
     lines.push(fg.cyan(`╭─${style.bold(" wcode ")}${"─".repeat(Math.max(2, w - 12))}╮`));
@@ -422,7 +565,6 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     const bottomFill = Math.max(2, w - 4 - statusWidth);
     lines.push(`${fg.cyan("╰─")}${style.dim(status)}${fg.cyan("─".repeat(bottomFill) + "╯")}`);
     bottomRows = lines.length;
-    stdout.write(lines.join("\r\n") + "\r");
     // reposition: cursor rests on the bottom-border row after the write; the
     // input row is exactly (inputLines.length - line) rows above it.
     const up = inputLines.length - editor.state.line;
@@ -432,14 +574,25 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       available,
     );
     const cursorCol = 4 + stringWidth(visibleBefore.text.slice(0, editor.state.col - visibleBefore.colOffset));
-    stdout.write(`\x1b[${up}A\r\x1b[${Math.min(cursorCol, w - 3)}C`);
+    const reposition = `\x1b[${up}A\r\x1b[${Math.min(cursorCol, w - 3)}C`;
     cursorRowInRegion = topRows.length + transientLines.length + 1 + editor.state.line;
+    return { body: lines.join("\r\n") + "\r", reposition };
+  }
+
+  function drawBottom(clearFirst: boolean): void {
+    // One synchronized write: the erase and the redraw must land in the same
+    // chunk — flicker only appears between writes.
+    const clear = clearFirst ? regionClearPrefix() : "";
+    const { body, reposition } = buildBottomRegion();
+    stdout.write(SYNC_BEGIN + CURSOR_HIDE + clear + body + reposition + CURSOR_SHOW + SYNC_END);
   }
 
   function printAbove(text: string): void {
-    clearRegion();
-    stdout.write(text.replace(/\n/g, "\r\n") + "\r\n");
-    drawBottom(false);
+    const clear = regionClearPrefix();
+    const { body, reposition } = buildBottomRegion();
+    stdout.write(
+      SYNC_BEGIN + CURSOR_HIDE + clear + text.replace(/\n/g, "\r\n") + "\r\n" + body + reposition + CURSOR_SHOW + SYNC_END,
+    );
   }
 
   // ----- busy spinner (Claude-Code-style loading animation) ----------------
@@ -448,14 +601,15 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     const s = Math.max(0, Math.round((Date.now() - spinStartedAt) / 1000));
     const t = controller.totals;
     const tok = t.inputTokens + t.outputTokens > 0 ? ` · ${fmtK(t.inputTokens + t.outputTokens)} tok` : "";
-    return `(${s}s · esc×2 to interrupt${tok})`;
+    return `(${s}s · esc to interrupt${tok})`;
   }
 
   function renderSpin(): void {
     const w = width();
     if (spinIsTool) {
       const frame = TOOL_SPIN[spinnerFrame % TOOL_SPIN.length]!;
-      transientLines = [`  ${fg.cyan(frame)} ${fg.cyan(truncate(spinLabel, w - 10))}`];
+      const label = spinLabel !== "" ? `${truncate(spinLabel, w - 10)} ` : "";
+      transientLines = [`  ${fg.cyan(frame)} ${label}${style.dim(spinElapsed())}`];
     } else {
       const frame = SPIN[spinnerFrame % SPIN.length]!;
       transientLines = [`  ${fg.magenta(frame)} ${style.bold(truncate(spinLabel, w - 20))} ${style.dim(spinElapsed())}`];
@@ -465,7 +619,7 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
   function startSpin(label: string, isTool = false): void {
     spinLabel = label;
     spinIsTool = isTool;
-    if (!isTool) spinStartedAt = Date.now();
+    spinStartedAt = Date.now();
     if (!spinActive) {
       spinActive = true;
       spinnerFrame = 0;
@@ -497,6 +651,9 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
 
   // ----- agent event rendering --------------------------------------------
 
+  let thinkingStartedAt = 0;
+  let thinkingChars = 0;
+
   function handleAgentEvent(event: AgentEvent): void {
     switch (event.type) {
       case "text_delta":
@@ -507,23 +664,36 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
         break;
       case "thinking_delta":
         stopSpin();
+        if (thinkingStartedAt === 0) {
+          thinkingStartedAt = Date.now();
+          thinkingChars = 0;
+        }
+        thinkingChars += event.delta.length;
         thinking.feed(event.delta, (line) => printAbove(line));
         break;
       case "tool_start":
-        startSpin(`● ${event.call.name}${event.summary ? `: ${truncate(event.summary, width() - 12)}` : ""}`, true);
+        stopSpin();
+        // the action card prints immediately; the spinner runs beneath it
+        // until the result replaces it (claude-code's ⏺ / ⎿ layout)
+        printAbove(
+          `  ${fg.green("⏺")} ${style.bold(event.call.name)}${event.summary ? style.dim(`(${truncate(event.summary, width() - 12)})`) : ""}`,
+        );
+        startSpin("", true);
         break;
       case "tool_update":
-        spinLabel = `● ${truncate(event.line, width() - 12)}`;
+        spinLabel = event.line;
         break;
       case "tool_end": {
         stopSpin();
-        const icon = event.isError ? fg.red("✗") : fg.green("✓");
-        const summary = event.output.display ? ` · ${style.dim(event.output.display)}` : "";
-        const lines = [`  ${icon} ${style.bold(event.call.name)}${summary}`];
+        const lines = [
+          event.isError
+            ? `  ${fg.red("⎿")} ${fg.red(event.output.display || "failed")}`
+            : `  ${style.dim("⎿")} ${style.dim(event.output.display || "(no output)")}`,
+        ];
         if (event.output.detail) {
           const detailLines = event.output.detail.split("\n");
-          for (const l of detailLines.slice(0, 20)) lines.push(style.dim(`  │ ${l}`));
-          if (detailLines.length > 20) lines.push(style.dim("  │ …"));
+          for (const l of colorizeDiffLines(detailLines.slice(0, 20))) lines.push(l);
+          if (detailLines.length > 20) lines.push(style.dim("    …"));
         }
         printAbove(lines.join("\r\n"));
         break;
@@ -532,13 +702,22 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
         stopSpin();
         thinking.flush((line) => printAbove(line));
         md.flush((line) => printAbove(line));
+        if (thinkingChars > 0 && thinkingStartedAt > 0) {
+          printAbove(style.dim(`· thought for ${((Date.now() - thinkingStartedAt) / 1000).toFixed(1)}s`));
+        }
+        thinkingStartedAt = 0;
+        thinkingChars = 0;
         printAbove("");
         break;
       case "notice":
-        printAbove(style.dim(`─ ${event.message} ─`));
+        // Transient churn goes to the toast corner; structural events stay in
+        // the transcript where they can be read back.
+        if (/^retrying|context prune|context overflow/.test(event.message)) showToast(event.message, "info");
+        else printAbove(style.dim(`─ ${event.message} ─`));
         break;
       case "turn_end": {
         stopSpin();
+        interruptArmedAt = 0;
         const u = event.totalUsage;
         printAbove(style.dim(`─ in ${fmtK(u.inputTokens)}, out ${fmtK(u.outputTokens)} ─`));
         if (event.changes && event.changes.length > 0) {
@@ -555,56 +734,66 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     }
   }
 
-  // ----- permission prompts -------------------------------------------------
-
-  /** Shared y/N prompt: takes over the bottom area until y/n/esc/enter. */
-  function promptYesNo(lines: string[], denyLine: string | null): Promise<boolean> {
-    return new Promise((resolve) => {
-      mode = "permission";
-      permissionResolve = (ok) => {
-        if (!ok && denyLine !== null) printAbove(denyLine);
-        resolve(ok);
-      };
-      stopSpin();
-      if (bottomRows > 0) stdout.write(`\x1b[${bottomRows}A\r\x1b[J`);
-      transientLines = [];
-      stdout.write(lines.join("\r\n") + "\r\n");
-      bottomRows = 0;
+  /** Colorize unified-diff lines (+ green / − red), dim everything else. */
+  function colorizeDiffLines(lines: string[], indent = "    "): string[] {
+    return lines.map((l) => {
+      if (l.startsWith("+")) return fg.green(indent + l);
+      if (l.startsWith("-")) return fg.red(indent + l);
+      if (l.startsWith("@@")) return fg.cyan(indent + l);
+      return style.dim(indent + l);
     });
   }
 
-  function askPermission(req: ToolPermissionRequest): Promise<boolean> {
+  // ----- permission prompts -------------------------------------------------
+
+  /** Shared y/n/a prompt: takes over the bottom area until answered. */
+  function promptAnswer(lines: string[], denyLine: string | null): Promise<PermissionAnswer> {
+    return new Promise((resolve) => {
+      mode = "permission";
+      permissionResolve = (ans) => {
+        if (ans === "no" && denyLine !== null) printAbove(denyLine);
+        resolve(ans);
+      };
+      stopSpin();
+      // clear must use cursorRowInRegion (the cursor rests at the edit row
+      // inside the region, not below it) and ride in the same write as the
+      // prompt — overshooting would erase transcript rows above the box.
+      const clear = regionClearPrefix();
+      transientLines = [];
+      bottomRows = 0;
+      cursorRowInRegion = 0;
+      stdout.write(SYNC_BEGIN + CURSOR_HIDE + clear + lines.join("\r\n") + "\r\n" + CURSOR_SHOW + SYNC_END);
+    });
+  }
+
+  function askPermission(req: ToolPermissionRequest): Promise<PermissionAnswer> {
     const detail = req.detail
-      ? req.detail
-          .split("\n")
-          .slice(0, 16)
-          .map((l) => (l.startsWith("+") ? fg.green(l) : l.startsWith("-") ? fg.red(l) : style.dim(l)))
-          .join("\r\n")
+      ? colorizeDiffLines(req.detail.split("\n").slice(0, 16), "").join("\r\n")
       : "";
-    return promptYesNo(
+    return promptAnswer(
       [
         `${fg.yellow(`● ${req.tool}`)} ${req.summary.length > 100 ? req.summary.slice(0, 100) + "…" : req.summary}`,
         detail,
-        `${fg.yellow("allow this action?")} ${style.dim("[y] yes · [n] no · [esc] no")}`,
+        `${fg.yellow("allow this action?")} ${style.dim("[y] yes · [a] always allow · [n] no (esc)")}`,
       ].filter((s) => s !== ""),
       style.dim("denied"),
     );
   }
 
-  /** Answer the active y/N prompt (permission or plan approval). */
-  function answerPrompt(ok: boolean): void {
+  /** Answer the active prompt (permission or plan approval). */
+  function answerPrompt(ans: PermissionAnswer): void {
     const resolve = permissionResolve;
     permissionResolve = null;
     mode = "input";
-    resolve?.(ok);
+    resolve?.(ans);
   }
 
-  /** Plan approval (exit_plan): y switches to build mode and implements. */
-  function askPlanApproval(req: { plan: string; planFile: string }): Promise<boolean> {
+  /** Plan approval (exit_plan): yes switches to build mode and implements. */
+  async function askPlanApproval(req: { plan: string; planFile: string }): Promise<boolean> {
     const allLines = req.plan.split("\n");
     const head = allLines.slice(0, 14).map((l) => style.dim(`  │ ${l}`));
     if (allLines.length > 14) head.push(style.dim("  │ …"));
-    return promptYesNo(
+    const ans = await promptAnswer(
       [
         `${fg.magenta("⏸ plan ready for review")} ${style.dim(`· ${req.planFile}`)}`,
         ...head,
@@ -612,6 +801,7 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       ],
       style.dim("plan kept — still in plan mode"),
     );
+    return ans !== "no";
   }
 
   // ----- raw key handling --------------------------------------------------
@@ -625,6 +815,21 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       if (key.name === "tab" && key.shift) {
         // shift+tab cycles modes; ignored mid-prompt (permission/plan dialogs own the keys).
         if (mode === "input") toggleMode();
+        return;
+      }
+      // ctrl+p: command palette
+      if (key.ctrl && !key.meta && key.name === "p") {
+        if (mode === "input") openPalette();
+        return;
+      }
+      // ctrl+o: compose the current input in $EDITOR
+      if (key.ctrl && !key.meta && key.name === "o") {
+        if (mode === "input" && !palette) void openExternalEditor();
+        return;
+      }
+      // alt+enter: queue the message instead of steering
+      if (key.name === "return" && key.meta) {
+        if (mode === "input" && !palette && !picker) void submit("queue");
         return;
       }
       if (key.char !== "" && key.name === "") {
@@ -697,14 +902,41 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
 
   function handleChunk(data: string): void {
     // Split into discrete keys: escape sequences stay atomic.
-    const keys = data.match(/\x1b\[[0-9;]*[A-Za-z~]|\x1b[0-9A-Za-z]|\r|\n|\x7f|\t|\x03|\x04|\x01|\x05|\x0b|\x15|\x17|[\s\S]/g) ?? [];
+    const keys = data.match(/\x1b\[[0-9;]*[A-Za-z~]|\x1b[0-9A-Za-z]|\r|\n|\x7f|\t|\x03|\x04|\x01|\x05|\x0b|\x0c|\x15|\x17|[\s\S]/g) ?? [];
     for (const key of keys) {
       if (mode === "permission") {
-        if (key === "y" || key === "Y") answerPrompt(true);
-        else if (key === "n" || key === "N" || key === "\x03" || key === "\x1b" || key === "\r") answerPrompt(false);
+        if (key === "y" || key === "Y" || key === "\r" || key === "1") answerPrompt("yes");
+        else if (key === "a" || key === "A" || key === "2") answerPrompt("always");
+        else if (key === "n" || key === "N" || key === "\x1b" || key === "\x03" || key === "3") answerPrompt("no");
         continue;
       }
-      // Model picker captures all keys while open.
+      // Command palette captures all keys while open.
+      if (palette) {
+        const n = paletteFiltered().length;
+        if (key === "\x1b[A") {
+          if (n > 0) palette.index = (palette.index - 1 + n) % n;
+          drawBottom(true);
+        } else if (key === "\x1b[B") {
+          if (n > 0) palette.index = (palette.index + 1) % n;
+          drawBottom(true);
+        } else if (key === "\r") {
+          void runPaletteSelection();
+        } else if (key === "\x1b" || key === "\x03" || key === "\x04") {
+          palette = null;
+          drawBottom(true);
+        } else if (key === "\x7f") {
+          palette.query = palette.query.slice(0, -1);
+          palette.index = 0;
+          drawBottom(true);
+        } else if (key.length === 1 && key >= " ") {
+          palette.query += key;
+          palette.index = 0;
+          drawBottom(true);
+        }
+        continue;
+      }
+
+      // Dialog picker (models, sessions) captures all keys while open.
       if (picker) {
         const n = picker.items.length;
         if (key === "\x1b[A") {
@@ -714,12 +946,14 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
           picker.index = (picker.index + 1) % n;
           drawBottom(true);
         } else if (key === "\r") {
-          const target = picker.items[picker.index]!;
-          closePicker();
-          printAbove(`${style.bold(fg.magenta("> /models"))}`);
-          printAbove(controller.switchModel(target.key));
+          const chosen = picker.items[picker.index]!;
+          const onPick = picker.onPick;
+          picker = null;
+          void onPick(chosen);
+          drawBottom(true);
         } else if (key === "\x1b" || key === "\x03" || key === "\x04") {
-          closePicker();
+          picker = null;
+          drawBottom(true);
         }
         continue;
       }
@@ -737,6 +971,20 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
         }
         editor.reset();
         updateHints();
+        drawBottom(true);
+        continue;
+      }
+      if (key === "\x0c") {
+        // ctrl+l: clear the screen, conversation stays (banner redraws as home)
+        stdout.write("\x1b[2J\x1b[3J\x1b[H");
+        printAbove(banner);
+        if (controller.resumeNotice !== "") printAbove(style.dim(controller.resumeNotice));
+        drawBottom(true);
+        continue;
+      }
+      if (key === "?" && mode === "input" && !controller.busy && editor.isEmpty() && menuItems.length === 0 && !fileMenu) {
+        // claude-code convention: "?" on empty input opens the shortcuts panel
+        printAbove(renderShortcuts());
         drawBottom(true);
         continue;
       }
@@ -778,17 +1026,20 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       }
       if (key === "\x1b" && !streaming && mode === "input" && !controller.busy) {
         // bare escape with no busy work: ignore (avoids clobbering input)
+        interruptArmedAt = 0;
         continue;
       }
       if (key === "\x1b" && controller.busy) {
-        // double-press to interrupt (opencode-style, guards against accidents)
-        if (Date.now() - lastEscAt < 5000) {
+        // double-press interrupt (opencode): the first esc arms for 5s so a
+        // stray escape doesn't kill a long-running turn mid-flight.
+        const now = Date.now();
+        if (interruptArmedAt > 0 && now - interruptArmedAt < 5000) {
+          interruptArmedAt = 0;
           controller.abort();
           printAbove(style.dim("· interrupted ·"));
-          lastEscAt = 0;
         } else {
-          lastEscAt = Date.now();
-          printAbove(style.dim("press esc again to interrupt"));
+          interruptArmedAt = now;
+          drawBottom(true); // hint row: "esc again to interrupt"
         }
         continue;
       }
@@ -837,21 +1088,54 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     });
   }
 
+  /** Generic dialog picker with a 9-row sliding window (tall dialogs would
+   * overflow short terminals and break the region row accounting). */
   function renderPicker(w: number): string[] {
     const items = picker!.items;
-    const rows = [style.dim("  select model · ↑↓ move · enter switch · esc cancel")];
-    items.forEach((entry, i) => {
-      const mark = entry.available ? fg.green("✓") : fg.red("✗");
-      const api = style.dim(` ${entry.provider.api}`);
-      const current = entry.key === controller.modelKey ? fg.green(" · current") : "";
-      const label = `${mark} ${entry.key}${api}${current}`;
-      if (i === picker!.index) {
+    const rows = [style.dim(`  ${picker!.title} · ↑↓ move · enter select · esc cancel`)];
+    const start = Math.max(0, Math.min(picker!.index - 4, items.length - 9));
+    items.slice(start, start + 9).forEach((item, i) => {
+      const realIndex = start + i;
+      const mark = item.mark === "ok" ? fg.green("✓") : item.mark === "fail" ? fg.red("✗") : " ";
+      const label = `${mark} ${item.label}${item.detail ? style.dim(`  ${item.detail}`) : ""}`;
+      if (realIndex === picker!.index) {
         rows.push(clampWidth(`  ${style.bold(fg.cyan(`❯ ${label}`))}`, w - 2));
       } else {
         rows.push(clampWidth(style.dim(`    ${label}`), w - 2));
       }
     });
+    if (items.length > 9) rows.push(style.dim(`  ${picker!.index + 1}/${items.length}`));
     return rows;
+  }
+
+  function renderPalette(w: number): string[] {
+    const items = paletteFiltered();
+    const queryNote = palette!.query === "" ? "type to filter" : `filter: ${palette!.query}`;
+    const rows = [style.dim(`  command palette · ${queryNote} · ↑↓ move · enter run · esc close`)];
+    if (items.length === 0) {
+      rows.push(style.dim("    (no matching commands)"));
+      return rows;
+    }
+    const start = Math.max(0, Math.min(palette!.index - 4, items.length - 9));
+    items.slice(start, start + 9).forEach((item, i) => {
+      const realIndex = start + i;
+      const label = `/${item.name}  ${item.description}`;
+      if (realIndex === palette!.index) {
+        rows.push(clampWidth(`  ${style.bold(fg.cyan(`❯ ${label}`))}`, w - 2));
+      } else {
+        rows.push(clampWidth(style.dim(`    ${label}`), w - 2));
+      }
+    });
+    if (items.length > 9) rows.push(style.dim(`  ${palette!.index + 1}/${items.length}`));
+    return rows;
+  }
+
+  /** The "?" shortcuts panel (claude-code opens one on "?" with empty input). */
+  function renderShortcuts(): string {
+    const w = width();
+    const rows = [style.bold("keyboard shortcuts")];
+    for (const [key, desc] of SHORTCUTS) rows.push(clampWidth(`  ${style.dim(key.padEnd(16))}${desc}`, w - 2));
+    return rows.join("\n");
   }
 
   function openPicker(): void {
@@ -860,15 +1144,156 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       printAbove(style.dim("no models configured. See /help or wcode help."));
       return;
     }
-    const currentIdx = items.findIndex((e) => e.key === controller.modelKey);
-    picker = { items, index: currentIdx >= 0 ? currentIdx : 0 };
     menuItems = [];
+    fileMenu = null;
+    picker = {
+      title: "select model",
+      items: items.map((entry) => ({
+        label: `${entry.key} · ${entry.provider.api}`,
+        mark: entry.available ? ("ok" as const) : ("fail" as const),
+        value: entry.key,
+      })),
+      index: Math.max(0, items.findIndex((e) => e.key === controller.modelKey)),
+      onPick: (item) => {
+        printAbove(`${style.bold(fg.magenta("> /models"))}`);
+        printAbove(controller.switchModel(item.value!));
+      },
+    };
     drawBottom(true);
   }
 
-  function closePicker(): void {
-    picker = null;
+  /** Interactive session list (opencode dialog-session-list, trimmed). */
+  function openSessionPicker(): void {
+    const sessions = listSessions();
+    if (sessions.length === 0) {
+      printAbove(style.dim("no saved sessions"));
+      return;
+    }
+    menuItems = [];
+    fileMenu = null;
+    picker = {
+      title: "resume session",
+      items: sessions.slice(0, 12).map((s) => ({
+        label: truncate(s.title ?? (s.preview || "(empty)"), 48),
+        detail: `${s.createdAt.slice(0, 16).replace("T", " ")} · ${s.model} · ${s.messageCount} msgs`,
+        value: s.file,
+      })),
+      index: 0,
+      onPick: (item) => {
+        printAbove(`${style.bold(fg.magenta("> /sessions"))}`);
+        const summary = sessions.find((s) => s.file === item.value);
+        if (summary) printAbove(controller.resumeSession(summary));
+      },
+    };
     drawBottom(true);
+  }
+
+  /** /theme with no args: interactive theme picker (keyboard-driven). */
+  function openThemePicker(): void {
+    const themes = listThemes();
+    menuItems = [];
+    fileMenu = null;
+    picker = {
+      title: "select theme",
+      items: themes.map((t) => ({
+        label: t.name,
+        detail: t.description,
+        mark: t.name === activeThemeName() ? ("ok" as const) : undefined,
+        value: t.name,
+      })),
+      index: Math.max(0, themes.findIndex((t) => t.name === activeThemeName())),
+      onPick: (item) => {
+        printAbove(controller.switchTheme(item.value!));
+      },
+    };
+    drawBottom(true);
+  }
+
+  // ----- command palette (ctrl+p) --------------------------------------------
+
+  function paletteFiltered(): PaletteItem[] {
+    return fuzzyFilter(palette!.all, palette!.query, (item) => `${item.name} ${item.description}`);
+  }
+
+  function openPalette(): void {
+    const all = buildPaletteItems();
+    if (all.length === 0) return;
+    menuItems = [];
+    fileMenu = null;
+    picker = null;
+    palette = { all, index: 0, query: "" };
+    drawBottom(true);
+  }
+
+  function buildPaletteItems(): PaletteItem[] {
+    const items: PaletteItem[] = [];
+    const run = (name: string): (() => void) => () => void runLine(`/${name}`);
+    for (const cmd of SLASH_COMMANDS) {
+      items.push({
+        name: cmd.name,
+        description: cmd.description,
+        run:
+          cmd.name === "models"
+            ? openPicker
+            : cmd.name === "sessions" || cmd.name === "resume"
+              ? openSessionPicker
+              : cmd.name === "theme"
+                ? openThemePicker
+                : run(cmd.name),
+      });
+    }
+    for (const cmd of loadCustomCommands(controller.cwd)) {
+      items.push({ name: cmd.name, description: cmd.description, run: () => void runLine(`/${cmd.name}`) });
+    }
+    items.push({
+      name: "quit",
+      description: "exit wcode (also: ctrl+d)",
+      run: () => {
+        mode = "exiting";
+        quit();
+      },
+    });
+    return items;
+  }
+
+  async function runPaletteSelection(): Promise<void> {
+    const item = paletteFiltered()[palette!.index];
+    if (!item) return;
+    palette = null;
+    await item.run();
+    drawBottom(true);
+  }
+
+  /** ctrl+o: edit the current input in $VISUAL/$EDITOR (opencode <leader>e). */
+  async function openExternalEditor(): Promise<void> {
+    const editorBin = process.env.VISUAL || process.env.EDITOR;
+    if (!editorBin) {
+      showToast("no $EDITOR or $VISUAL set", "warning");
+      return;
+    }
+    const file = join(tmpdir(), `wcode-editor-${process.pid}-${Date.now()}.md`);
+    try {
+      writeFileSync(file, editor.text, "utf8");
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdout.write(CURSOR_SHOW);
+      const res = spawnSync(editorBin, [file], { stdio: "inherit" });
+      if (res.error) throw res.error;
+      if (res.status === 0) {
+        const content = readFileSync(file, "utf8").replace(/\r\n/g, "\n").replace(/\n+$/, "");
+        if (content.trim() !== "") editor.reset(content);
+      } else {
+        showToast(`${editorBin} exited with code ${res.status}`, "warning");
+      }
+    } catch (err) {
+      showToast(`editor failed: ${(err as Error).message}`, "error");
+    } finally {
+      rmSync(file, { force: true });
+      stdin.setRawMode(true);
+      stdin.resume();
+      updateHints();
+      drawBottom(true);
+    }
   }
 
   function insertFileSelection(): void {
@@ -912,22 +1337,14 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
   }
 
   let running = false;
-  async function submit(): Promise<void> {
+  async function submit(deliver: "steer" | "queue" = "steer"): Promise<void> {
     // Enter with the slash menu open executes the highlighted command: expand
-    // the box to the resolved command FIRST, so the /models interception below
+    // the box to the resolved command first, so picker interception in runLine
     // also covers menu execution (typing "/mo" + enter must open the picker).
     if (menuItems.length > 0) {
       editor.reset(`/${menuItems[menuIndex]!.name}`);
       menuItems = [];
       menuIndex = 0;
-    }
-    // /models opens the interactive picker instead of printing a list.
-    if (editor.text.trim() === "/models") {
-      editor.reset();
-      updateHints();
-      printAbove(`${style.bold(fg.magenta("> /models"))}`);
-      openPicker();
-      return;
     }
     let text = editor.text.replace(/\\\n$/s, "\n").trim();
     if (text === "") {
@@ -935,23 +1352,39 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       return;
     }
     text = expandPastes(text);
-    if (running) {
-      queuedPrompt = text; // compose next message while the agent works
-      editor.reset();
-      updateHints();
+    editor.reset();
+    updateHints();
+    await runLine(text, deliver);
+  }
+
+  /** Run one submitted line: echo it, work (or steer/queue while busy), then
+   * drain the queue. Shared by Enter, alt+enter, the palette and pickers. */
+  async function runLine(text: string, deliver: "steer" | "queue" = "steer"): Promise<void> {
+    // Interactive pickers open instead of printing lists (TUI-only views).
+    const trimmed = text.trim();
+    if (trimmed === "/models" || trimmed === "/sessions" || trimmed === "/resume" || trimmed === "/theme") {
+      printAbove(`${style.bold(fg.magenta("> " + trimmed))}`);
+      if (trimmed === "/models") openPicker();
+      else if (trimmed === "/theme") openThemePicker();
+      else openSessionPicker();
+      return;
+    }
+    if (running || controller.busy) {
+      // opencode inbox: plain text steers into the running prompt at the next
+      // turn boundary; commands and alt+enter wait in the post-run queue.
+      const how = controller.submitWhileBusy(text, deliver);
+      printAbove(style.dim(how === "steered" ? `⏎ steer: ${truncate(text, 60)}` : `⏎ queued: ${truncate(text, 60)}`));
       drawBottom(true);
       return;
     }
     editor.pushHistory(text);
-    editor.reset();
-    updateHints();
     printAbove(`${style.bold(fg.magenta("> " + (text.length > 400 ? text.slice(0, 400) + "…" : text)))}`);
-    startSpin("Working…");
+    startSpin(`${spinVerb()}…`);
     running = true;
     streaming = true;
     try {
       const outcome = await controller.handleLine(text);
-      if (outcome.kind === "prompt") await controller.runPrompt(text);
+      if (outcome.kind === "prompt") await controller.runPrompt(outcome.promptText ?? text);
       else if (outcome.kind === "exit") {
         mode = "exiting";
         quit();
@@ -964,25 +1397,11 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
       streaming = false;
       stopSpin();
     }
-    if (mode === "exiting") return;
-    if (queuedPrompt !== null) {
-      const next = queuedPrompt;
-      queuedPrompt = null;
-      printAbove(`${style.bold(fg.magenta("> " + truncate(next, 400)))}`);
-      startSpin("Working…");
-      running = true;
-      try {
-        const outcome = await controller.handleLine(next);
-        if (outcome.kind === "prompt") await controller.runPrompt(next);
-        else if (outcome.kind === "exit") {
-          mode = "exiting";
-          quit();
-          return;
-        }
-      } finally {
-        running = false;
-        stopSpin();
-      }
+    if (isExiting()) return;
+    // Drain the post-run queue (queued prompts + steers that missed the run).
+    for (const p of controller.drainPending()) {
+      if (isExiting()) break;
+      await runLine(p);
     }
     drawBottom(true);
   }
@@ -991,17 +1410,23 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
 
   const cleanup = () => {
     if (spinTimer) clearTimeout(spinTimer);
+    if (toastTimer) clearInterval(toastTimer);
     stdout.write("\x1b[?2004l"); // bracketed paste off
+    stdout.write(CURSOR_SHOW);
     stdin.setRawMode(false);
     stdin.pause();
   };
 
-  const onResize = () => drawBottom(true);
+  const onResize = () => {
+    banner = buildBanner(); // the next ctrl+l prints the fresh-width banner
+    drawBottom(true);
+  };
   stdout.on("resize", onResize);
 
   function quit(): void {
     cleanup();
-    stdout.on("resize", onResize);
+    stdout.removeListener("resize", onResize);
+    controller.shutdown(); // kill MCP children so they don't orphan
     printAbove(style.dim("bye"));
     process.exit(0);
   }
@@ -1014,12 +1439,16 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     }
   };
   process.on("SIGINT", onSigint);
+  process.on("SIGTERM", () => {
+    mode = "exiting";
+    quit();
+  });
 
   // banner: block-letter "wcode" (figlet, font "ANSI Shadow") as the session
   // home page. Meta rides beside the logo on wide terminals, stacks beneath
   // it on medium ones, and a mini logo keeps every row inside the terminal
   // when narrow — a wrapped banner row would corrupt the bottom-region row
-  // accounting.
+  // accounting. Rebuilt on resize so ctrl+l always prints the right width.
   const LOGO = [
     "██╗    ██╗ ██████╗ ██████╗ ██████╗ ███████╗",
     "██║    ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝",
@@ -1029,45 +1458,86 @@ export async function runTuiSession(options: SessionOptions): Promise<void> {
     " ╚══╝╚══╝  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
   ];
   const LOGO_WIDTH = 43;
-  const logoStyled = LOGO.map((r) => style.bold(fg.cyan(padToWidth(r, LOGO_WIDTH))));
-  const meta1 = `wcode v${VERSION}`;
-  const meta2 = `model: ${controller.modelKey} · ${shortCwd(options.cwd)}`;
-  const hint = style.dim("type a task · /help for commands · /exit to quit");
-  let banner: string;
-  const termW = width();
-  if (termW < LOGO_WIDTH + 3) {
-    banner = [
-      `${style.bold("▄▄▄")}  ${style.bold("wcode")} ${style.dim("v" + VERSION)}`,
-      `${style.bold("█▀█")}  ${style.dim("model:")} ${fg.cyan(controller.modelKey)}`,
-      `${style.bold("█▄█")}  ${style.dim("/help · /exit to quit")}`,
-    ].join("\n");
-  } else if (termW >= LOGO_WIDTH + 2 + stringWidth(meta1) + 2) {
-    banner = [
-      logoStyled[0]!,
-      `${logoStyled[1]}  ${style.bold(meta1)}`,
-      `${logoStyled[2]}  ${style.dim(truncate(meta2, termW - LOGO_WIDTH - 3))}`,
-      logoStyled[3]!,
-      logoStyled[4]!,
-      logoStyled[5]!,
-      "",
-      ` ${clampWidth(hint, termW - 2)}`,
-    ].join("\n");
-  } else {
-    banner = [
+  function buildBanner(): string {
+    const logoStyled = LOGO.map((r) => style.bold(fg.cyan(padToWidth(r, LOGO_WIDTH))));
+    const meta1 = `wcode v${VERSION}`;
+    const meta2 = `model: ${controller.modelKey} · ${shortCwd(options.cwd)}`;
+    const hint = style.dim("type a task · ctrl+p palette · /help for commands · /exit to quit");
+    const termW = width();
+    if (termW < LOGO_WIDTH + 3) {
+      return [
+        `${style.bold("▄▄▄")}  ${style.bold("wcode")} ${style.dim("v" + VERSION)}`,
+        `${style.bold("█▀█")}  ${style.dim("model:")} ${fg.cyan(controller.modelKey)}`,
+        `${style.bold("█▄█")}  ${style.dim("/help · /exit to quit")}`,
+      ].join("\n");
+    }
+    if (termW >= LOGO_WIDTH + 2 + stringWidth(meta1) + 2) {
+      return [
+        logoStyled[0]!,
+        `${logoStyled[1]}  ${style.bold(meta1)}`,
+        `${logoStyled[2]}  ${style.dim(truncate(meta2, termW - LOGO_WIDTH - 3))}`,
+        logoStyled[3]!,
+        logoStyled[4]!,
+        logoStyled[5]!,
+        "",
+        ` ${clampWidth(hint, termW - 2)}`,
+      ].join("\n");
+    }
+    return [
       ...logoStyled,
       ` ${clampWidth(`${style.bold(meta1)} · ${style.dim(meta2)}`, termW - 1)}`,
       "",
       ` ${clampWidth(hint, termW - 2)}`,
     ].join("\n");
   }
+  let banner = buildBanner();
   printAbove(banner);
+  if (controller.resumeNotice !== "") printAbove(style.dim(controller.resumeNotice));
   drawBottom(true);
+
+  // `wcode "fix the failing test"` — start working immediately (claude-code
+  // passes the CLI prompt straight into the session).
+  if (options.initialPrompt !== undefined && options.initialPrompt.trim() !== "") {
+    void runLine(expandPastes(options.initialPrompt.trim()));
+  }
 
   // wait until quit() exits the process
   await new Promise(() => {});
 }
 
 // ----- helpers --------------------------------------------------------------
+
+// Prompt history persisted across sessions (opencode keeps per-session drafts;
+// wcode keeps a shared recent-prompt file, oldest first).
+const HISTORY_FILE = join(CONFIG_DIR, "history.jsonl");
+const HISTORY_LIMIT = 500;
+
+function loadHistory(): string[] {
+  try {
+    return readFileSync(HISTORY_FILE, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .slice(-HISTORY_LIMIT)
+      .map((l) => {
+        try {
+          return JSON.parse(l) as string;
+        } catch {
+          return "";
+        }
+      })
+      .filter((s) => s !== "");
+  } catch {
+    return [];
+  }
+}
+
+function appendHistory(text: string): void {
+  try {
+    appendFileSync(HISTORY_FILE, JSON.stringify(text) + "\n");
+  } catch {
+    /* best effort */
+  }
+}
 
 function shortCwd(cwd: string): string {
   return cwd.replace(/^\/Users\/[^/]+/, "~");

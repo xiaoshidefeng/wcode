@@ -4,8 +4,13 @@ import { resolve } from "node:path";
 import { loadRegistry, resolveModel, listModels, ensureDirs, saveProviderApiKey, CONFIG_PATH } from "./config.js";
 import { createTools } from "./tools/index.js";
 import type { PermissionPolicy } from "./tools/index.js";
+import { createTaskTool } from "./tools/task.js";
 import { buildSystemPrompt, loadProjectInstructions } from "./system-prompt.js";
 import { Agent } from "./agent/agent.js";
+import { PermissionGate } from "./permissions.js";
+import { loadSettings } from "./settings.js";
+import { findCustomCommand, expandCommand } from "./commands.js";
+import { McpRegistry, loadMcpServers } from "./mcp/index.js";
 import { runPlainSession } from "./ui/plain.js";
 import { runTuiSession } from "./ui/tui.js";
 import { fg, style, formatDuration } from "./ui/render.js";
@@ -23,6 +28,10 @@ interface Args {
   help: boolean;
   version: boolean;
   plain: boolean;
+  allowedTools?: string;
+  disallowedTools?: string;
+  outputFormat: "text" | "json";
+  appendSystemPrompt?: string;
   positional: string[];
 }
 
@@ -33,7 +42,7 @@ ${style.bold("wcode")} — a coding agent CLI with pluggable model providers
 
 ${style.bold("usage")}
   wcode                          interactive session
-  wcode "fix the failing test"   interactive session with an initial prompt
+  wcode "fix the failing test"   interactive session, starts on the task
   wcode -p "explain Makefile"    one-shot: answer and exit
   wcode <command>
 
@@ -45,6 +54,14 @@ ${style.bold("commands")}
 
 ${style.bold("options")}
   -p, --print         non-interactive: print the answer and exit
+      --output-format <text|json>
+                      print-mode output; json prints {result, model, cost, ...}
+      --append-system-prompt <text>
+                      extra instructions appended to the system prompt
+      --allowed-tools <rules>
+                      comma-separated allow rules, e.g. "bash(git *),read"
+      --disallowed-tools <rules>
+                      comma-separated deny rules, e.g. "bash(rm -rf *)"
   -m, --model <sel>   model selector "provider/model" (default from config)
       --yolo          skip permission prompts (also: /yolo in session)
       --edit          start in edit mode: file edits auto-approved, bash still
@@ -59,7 +76,7 @@ ${style.bold("options")}
   -h, --help
 
 ${style.bold("configuration")}
-  ${CONFIG_PATH} — define custom providers/models:
+  ${CONFIG_PATH} — define custom providers/models and mcpServers:
 
     {
       "defaultModel": "zhipu/glm-4.6",
@@ -70,16 +87,24 @@ ${style.bold("configuration")}
           "apiKey": "\${ZHIPU_API_KEY}",
           "models": [{ "id": "glm-4.6", "contextWindow": 200000, "maxTokens": 128000 }]
         }
+      },
+      "mcpServers": {
+        "fetch": { "command": "npx", "args": ["-y", "mcp-server-fetch"] }
       }
     }
 
   apiKey supports "\${ENV}" variables and "!cmd -x" command output.
   Built-ins (anthropic, openai, zhipu, deepseek, moonshot, dashscope,
   openrouter, google, ollama) can be overridden or extended by id.
+
+  Permission rules live in ~/.wcode/settings.json and .wcode/settings.json
+  (permissions.allow / permissions.deny, e.g. ["bash(git *)", "bash(rm -rf *)"]).
+  Custom slash commands: .wcode/commands/*.md (project) and
+  ~/.wcode/commands/*.md (user) with $ARGUMENTS substitution.
 `.trim();
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { print: false, yolo: false, plan: false, edit: false, help: false, version: false, plain: false, positional: [] };
+  const args: Args = { print: false, yolo: false, plan: false, edit: false, help: false, version: false, plain: false, outputFormat: "text", positional: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "-p" || a === "--print") args.print = true;
@@ -87,6 +112,13 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--plan") args.plan = true;
     else if (a === "--edit") args.edit = true;
     else if (a === "--plain") args.plain = true;
+    else if (a === "--allowed-tools") args.allowedTools = argv[++i];
+    else if (a === "--disallowed-tools") args.disallowedTools = argv[++i];
+    else if (a === "--output-format") {
+      const v = argv[++i];
+      if (v !== "text" && v !== "json") throw new UserError(`--output-format must be "text" or "json", got "${v}"`);
+      args.outputFormat = v;
+    } else if (a === "--append-system-prompt") args.appendSystemPrompt = argv[++i];
     else if (a === "-h" || a === "--help") args.help = true;
     else if (a === "--version") args.version = true;
     else if (a === "-m" || a === "--model") args.model = argv[++i];
@@ -158,7 +190,17 @@ async function main(): Promise<number> {
       console.error(fg.red("print mode (-p) needs a prompt, e.g. wcode -p \"summarize this repo\""));
       return 2;
     }
-    return runPrint({ prompt, cwd, model, policy });
+    return runPrint({
+      prompt,
+      cwd,
+      model,
+      policy,
+      registry,
+      allowedTools: args.allowedTools?.split(",").map((s) => s.trim()).filter((s) => s !== ""),
+      disallowedTools: args.disallowedTools?.split(",").map((s) => s.trim()).filter((s) => s !== ""),
+      outputFormat: args.outputFormat,
+      appendSystemPrompt: args.appendSystemPrompt,
+    });
   }
 
   let resumeFile: string | undefined;
@@ -180,6 +222,10 @@ async function main(): Promise<number> {
     policy,
     resumeFile,
     mode: args.edit ? ("edit" as const) : args.plan ? ("plan" as const) : undefined,
+    initialPrompt: prompt,
+    allowedTools: args.allowedTools?.split(",").map((s) => s.trim()).filter((s) => s !== ""),
+    disallowedTools: args.disallowedTools?.split(",").map((s) => s.trim()).filter((s) => s !== ""),
+    appendSystemPrompt: args.appendSystemPrompt,
   };
   const useTui = process.stdin.isTTY && process.stdout.isTTY && !args.plain;
   if (useTui) await runTuiSession(sessionOptions);
@@ -223,7 +269,7 @@ async function cmdSessions(): Promise<number> {
   sessions.slice(0, 20).forEach((s, i) => {
     const here = s.cwd === cwd ? style.bold(" *") : "";
     console.log(
-      `${style.bold(String(i + 1).padStart(2))}  ${style.dim(s.createdAt.slice(0, 16).replace("T", " "))}  ${style.dim(s.model)}  ${s.preview || style.dim("(empty)")}${here}`,
+      `${style.bold(String(i + 1).padStart(2))}  ${style.dim(s.createdAt.slice(0, 16).replace("T", " "))}  ${style.dim(s.model)}  ${s.title ?? (s.preview || style.dim("(empty)"))}${here}`,
     );
   });
   return 0;
@@ -236,26 +282,70 @@ interface PrintRunOptions {
   cwd: string;
   model: ReturnType<typeof resolveModel>;
   policy: PermissionPolicy;
+  registry: ReturnType<typeof loadRegistry>;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  outputFormat: "text" | "json";
+  appendSystemPrompt?: string;
 }
 
 async function runPrint(options: PrintRunOptions): Promise<number> {
-  const { prompt, cwd, model, policy } = options;
+  const { prompt, cwd, model, policy, registry } = options;
+  const settings = loadSettings(cwd);
+  const gate = new PermissionGate(
+    [...settings.settings.allow, ...(options.allowedTools ?? [])],
+    [...settings.settings.deny, ...(options.disallowedTools ?? [])],
+  );
+
+  // Custom commands expand to their template in print mode too.
+  const effectivePrompt = prompt.startsWith("/")
+    ? (() => {
+        const match = prompt.match(/^\/([a-z0-9_-]+)(?:\s+([\s\S]*))?$/i);
+        if (!match) return prompt;
+        const custom = findCustomCommand(cwd, match[1]!);
+        return custom ? expandCommand(custom, match[2] ?? "") : prompt;
+      })()
+    : prompt;
+
   const tools = createTools({ supportsImages: (model.model.input ?? ["text"]).includes("image"), policy });
   const projectInstructions = await loadProjectInstructions(cwd);
   const requestPermission = async (req: { tool: string; summary: string }): Promise<boolean> => {
     console.error(fg.yellow(`[permission denied in print mode: ${req.tool}: ${req.summary} — rerun with --yolo to allow]`));
     return false;
   };
+
+  // MCP servers from config / .mcp.json join the print run too (best effort).
+  const mcp = new McpRegistry(loadMcpServers(cwd, registry));
+  await mcp.start();
+  tools.push(...mcp.tools());
+
+  // Subagent dispatch works in print mode as well; mutations still deny
+  // (non-yolo print runs refuse all writes) or flow through --yolo.
+  tools.push(
+    createTaskTool({
+      cwd,
+      model: () => model,
+      effectivePolicy: () => policy,
+      requestPermission,
+      gate: () => (gate.isEmpty ? undefined : gate),
+      baseTools: () => tools.filter((t) => t.name !== "task"),
+    }),
+  );
+
   const agent = new Agent({
     cwd,
     model,
-    system: buildSystemPrompt({ cwd, toolNames: tools.map((t) => t.name), projectInstructions }),
+    system: buildSystemPrompt({ cwd, toolNames: tools.map((t) => t.name), projectInstructions, append: options.appendSystemPrompt }),
     tools,
     policy,
+    gate: gate.isEmpty ? undefined : gate,
     requestPermission,
   });
 
   const isTty = process.stdout.isTTY;
+  const isJson = options.outputFormat === "json";
+  let resultText = "";
+  let sawError = false;
   let lastWasText = false;
   const newlineIfNeeded = () => {
     if (lastWasText) {
@@ -266,23 +356,43 @@ async function runPrint(options: PrintRunOptions): Promise<number> {
   const handleEvent = (event: AgentEvent) => {
     switch (event.type) {
       case "text_delta":
-        process.stdout.write(event.delta);
-        lastWasText = true;
+        if (isJson) resultText += event.delta;
+        else {
+          process.stdout.write(event.delta);
+          lastWasText = true;
+        }
         break;
       case "thinking_delta":
-        process.stderr.write(style.dim(event.delta));
+        if (!isJson) process.stderr.write(style.dim(event.delta));
         break;
       case "tool_start":
         newlineIfNeeded();
-        if (isTty) console.error(fg.cyan(`● ${event.call.name} ${event.summary}`));
+        if (isTty && !isJson) console.error(fg.cyan(`● ${event.call.name} ${event.summary}`));
+        break;
+      case "tool_update":
+        // Subagent/task progress streams here too — parallel tasks used to
+        // be silent between dispatch and report in print mode.
+        if (isTty && !isJson) {
+          newlineIfNeeded();
+          console.error(style.dim(`  ↳ ${event.line}`));
+        }
         break;
       case "tool_end":
-        if (isTty) console.error(`  ${event.isError ? fg.red("✗") : fg.green("✓")} ${event.call.name} ${style.dim(formatDuration(event.durationMs))}`);
+        if (isTty && !isJson) console.error(`  ${event.isError ? fg.red("✗") : fg.green("✓")} ${event.call.name} ${style.dim(formatDuration(event.durationMs))}`);
+        break;
+      case "notice":
+        if (!isJson) {
+          newlineIfNeeded();
+          console.error(style.dim(event.message));
+        }
         break;
       case "error":
-        newlineIfNeeded();
-        console.error(fg.red(`error: ${event.errorMessage}`));
-        exitCode = 1;
+        sawError = true;
+        if (isJson) resultText += `\n[error] ${event.errorMessage}`;
+        else {
+          newlineIfNeeded();
+          console.error(fg.red(`error: ${event.errorMessage}`));
+        }
         break;
       default:
         break;
@@ -291,11 +401,30 @@ async function runPrint(options: PrintRunOptions): Promise<number> {
 
   let exitCode = 0;
   process.on("SIGINT", () => agent.abort());
-  const totals = await agent.run(prompt, handleEvent);
-  newlineIfNeeded();
-  if (isTty && (totals.inputTokens > 0 || totals.outputTokens > 0)) {
-    console.error(style.dim(`\n[in ${totals.inputTokens} tok, out ${totals.outputTokens} tok]`));
+  const totals = await agent.run(effectivePrompt, handleEvent);
+  if (isJson) {
+    console.log(
+      JSON.stringify(
+        {
+          result: resultText.trim(),
+          model: model.key,
+          is_error: sawError,
+          inputTokens: totals.inputTokens,
+          outputTokens: totals.outputTokens,
+          cost: Number(totals.cost.toFixed(6)),
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    newlineIfNeeded();
+    if (isTty && (totals.inputTokens > 0 || totals.outputTokens > 0)) {
+      console.error(style.dim(`\n[in ${totals.inputTokens} tok, out ${totals.outputTokens} tok]`));
+    }
   }
+  if (sawError) exitCode = 1;
+  mcp.close();
   return exitCode;
 }
 

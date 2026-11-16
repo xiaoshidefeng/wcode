@@ -15,6 +15,9 @@ export interface ToolPermissionRequest {
   tool: string;
   summary: string;
   detail?: string;
+  /** Identifying argument (bash → command, file tools → path) — the "always
+   * allow" answer turns this into a permission rule. */
+  subject?: string;
 }
 
 export interface ToolContext {

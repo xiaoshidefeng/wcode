@@ -5,7 +5,7 @@ import { platform } from "node:process";
 
 export type PromptMode = "build" | "edit" | "plan";
 
-export function buildSystemPrompt(opts: { cwd: string; toolNames?: string[]; projectInstructions?: string; mode?: PromptMode }): string {
+export function buildSystemPrompt(opts: { cwd: string; toolNames?: string[]; projectInstructions?: string; mode?: PromptMode; append?: string }): string {
   const sections: string[] = [];
 
   sections.push(
@@ -36,12 +36,15 @@ export function buildSystemPrompt(opts: { cwd: string; toolNames?: string[]; pro
   sections.push(
     [
       `# Tools`,
-      `- Use the dedicated tools (read, edit, write, grep, glob, ls, bash) instead of shell equivalents — they are faster and safer.`,
+      `- Use the dedicated tools (read, edit, write, grep, glob, ls) instead of shell equivalents — they are faster and safer.`,
       `- Independent tool calls can be issued together in one turn (e.g. several reads); dependent calls must wait for previous results.`,
       `- read output has line-number prefixes ("  42  code") for display only; never include them in edit old_string.`,
       `- edit requires an exact unique old_string; read the file first if unsure of the exact text.`,
       `- write fails on existing files you have not read; read them first.`,
       `- bash commands may ask the user for approval. Keep commands short and inspectable; avoid interactive commands.`,
+      `- For broad codebase exploration (finding where something lives, surveying many files) prefer the task tool with subagent_type "explore": it keeps your own context small. For quick single-file lookups use read/grep directly.`,
+      `- webfetch/websearch reach the internet: use websearch for lookups (docs, errors, versions) and webfetch to read a specific URL.`,
+      `- Tools named mcp__<server>__<tool> come from configured MCP servers; they may ask approval like built-ins.`,
       `- For multi-step work (roughly 3+ steps), maintain a task list with todo_write: rewrite the full list whenever it changes, keep exactly one task in_progress, mark tasks completed as soon as they are done. Skip it for trivial work.`,
     ].join("\n"),
   );
@@ -78,6 +81,10 @@ export function buildSystemPrompt(opts: { cwd: string; toolNames?: string[]; pro
         opts.projectInstructions.trim(),
       ].join("\n"),
     );
+  }
+
+  if (opts.append && opts.append.trim() !== "") {
+    sections.push(opts.append.trim());
   }
 
   return sections.join("\n\n");

@@ -45,7 +45,10 @@ function handle(req, res, body) {
     state.requests.push(parsed);
 
     if (parsed.stream !== true) throw new Error("expected stream:true");
-    if (typeof parsed.system !== "string" || parsed.system === "") throw new Error("expected system");
+    // system arrives as a string, or as a one-block array when prompt caching
+    // attaches its breakpoint (default on for anthropic-messages providers).
+    const systemText = typeof parsed.system === "string" ? parsed.system : parsed.system?.[0]?.text;
+    if (typeof systemText !== "string" || systemText === "") throw new Error("expected system");
 
     // /compact-style summarization request: no tools offered.
     if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) {

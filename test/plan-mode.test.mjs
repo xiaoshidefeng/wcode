@@ -60,7 +60,7 @@ test("plan policy beats yolo: even allow-all permission cannot execute a mutatin
 test("planModeTools: read-only set + exit_plan only", () => {
   const tools = createTools({ supportsImages: false, policy: "ask" });
   const plan = planModeTools(tools, createExitPlanTool(async () => true));
-  assert.deepEqual(plan.map((t) => t.name).sort(), ["exit_plan", "glob", "grep", "ls", "read"]);
+  assert.deepEqual(plan.map((t) => t.name).sort(), ["exit_plan", "glob", "grep", "ls", "read", "webfetch", "websearch"]);
 });
 
 test("exit_plan tool: asks with the plan, reports approval/rejection", async () => {
@@ -128,7 +128,7 @@ test("SessionController: mode toggles swap toolset, policy gate and system promp
 
     assert.equal(controller.toggleMode(), "plan");
     const planToolNames = controller.agent.options.tools.map((t) => t.name);
-    assert.deepEqual(planToolNames.filter((n) => n !== "exit_plan" && n !== "todo_write").every((n) => ["read", "grep", "glob", "ls"].includes(n)), true);
+    assert.deepEqual(planToolNames.filter((n) => n !== "exit_plan" && n !== "todo_write" && n !== "task" && !n.startsWith("web")).every((n) => ["read", "grep", "glob", "ls"].includes(n)), true);
     assert.ok(planToolNames.includes("exit_plan"));
     assert.ok(planToolNames.includes("todo_write"), "task list stays available in plan mode");
     assert.equal(controller.agent.options.policy, "plan");
